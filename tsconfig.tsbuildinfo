@@ -1,0 +1,1 @@
+{"root":["./src/main.ts","./src/app/state.ts","./src/dsp/features.ts","./src/dsp/fft.ts","./src/dsp/filter.ts","./src/input/gyroadapter.ts","./src/input/mouseadapter.ts","./src/input/types.ts","./src/share/hash.ts","./src/share/png.ts","./src/viz/fingerprint.ts","./src/viz/morph.ts","./src/viz/seismograph.ts","./vite.config.ts"],"version":"5.9.3"}
