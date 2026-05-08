@@ -4,27 +4,15 @@ import { GyroAdapter, isGyroSupported } from "./input/gyroAdapter";
 import { MouseAdapter } from "./input/mouseAdapter";
 import type { InputAdapter, Sample } from "./input/types";
 import { PermissionDeniedError } from "./input/types";
-import { HighPass, LowPass, deadband } from "./dsp/filter";
+import { LowPass } from "./dsp/filter";
 import { extract, type TremorFeatures } from "./dsp/features";
-import { Seismograph } from "./viz/seismograph";
+import { Painter, pickPalette, renderPaintingFinal, type PaintPoint } from "./viz/painter";
 import { renderFingerprint } from "./viz/fingerprint";
-import { runMorph } from "./viz/morph";
 import { downloadPNG, shareCanvas } from "./share/png";
 import { decodeFeatures, encodeFeatures, readHashFromUrl } from "./share/hash";
 
-const RECORD_SECONDS = 10;
-const CALIBRATE_MS = 2000;
-
-// Gyro: iOS accelerometer noise σ ≈ 50–80 mg even when stationary.
-// Anything below this threshold we treat as "still". Tremor signals worth
-// drawing are typically 100 mg+.
-const GYRO_NOISE_FLOOR = 0.12; // m/s²
-
-// Reference amplitude — defines what "fills the polar ring" looks like.
-// Same recording always renders at the same absolute size, so a still
-// session reads as a quiet wobble and a shaky session fills the ring.
-const GYRO_REF_AMP = 0.6;  // m/s² ≈ moderate tremor
-const MOUSE_REF_AMP = 8;   // px/frame
+const RECORD_SECONDS = 15;
+const CALIBRATE_MS = 800;
 
 const root = document.getElementById("app") as HTMLElement;
 const sm = new StateMachine();
@@ -32,26 +20,26 @@ const sm = new StateMachine();
 const isCoarsePointer = window.matchMedia("(pointer: coarse)").matches;
 const inputMode: "gyro" | "mouse" = isCoarsePointer && isGyroSupported() ? "gyro" : "mouse";
 
+let adapter: InputAdapter | null = null;
+let painter: Painter | null = null;
+
 const xs: number[] = [];
 const ys: number[] = [];
 const zs: number[] = [];
-const hpX = new HighPass();
-const hpY = new HighPass();
-const hpZ = new HighPass();
-const lpX = new LowPass(0.4);
-const lpY = new LowPass(0.4);
-const lpZ = new LowPass(0.4);
+
+let tiltLP = new LowPass(0.25);
+let pitchLP = new LowPass(0.25);
+let speedLP = new LowPass(0.4);
+let tiltOffset = 0;
+let pitchOffset = 0;
+const calibTiltSamples: number[] = [];
+const calibPitchSamples: number[] = [];
+
 let recordStart = 0;
 let recordTimer: number | null = null;
 let stallCheck: number | null = null;
-// Tracks whether the raw input source is producing any samples at all.
-// Post-deadband filtered values can legitimately be zero (still phone), so
-// we monitor pre-filter activity to detect a dead motion API.
 let rawSamplesSeen = 0;
 let rawAnyNonZero = false;
-
-let adapter: InputAdapter | null = null;
-let seismograph: Seismograph | null = null;
 
 function clearRoot(): void {
   root.innerHTML = "";
@@ -63,12 +51,12 @@ function renderLanding(): void {
   screen.className = "screen";
   screen.innerHTML = `
     <div>
-      <h1 class="title">Can you hold still?</h1>
+      <h1 class="title">Paint with motion</h1>
       <button class="begin" type="button">Begin</button>
       <p class="caption">${
         inputMode === "gyro"
-          ? "Reading from your phone's motion sensors"
-          : "Reading from your mouse"
+          ? "Tilt your phone to move the brush. 10 seconds."
+          : "Move your mouse to paint. 10 seconds."
       }</p>
     </div>
   `;
@@ -85,7 +73,7 @@ function renderCalibrating(): void {
   screen.innerHTML = `
     <div>
       <h1 class="title">${
-        inputMode === "gyro" ? "Hold the phone naturally" : "Rest your hand on the mouse"
+        inputMode === "gyro" ? "Hold the phone how you'd like" : "Settle your mouse"
       }</h1>
       <p class="caption">Calibrating…</p>
     </div>
@@ -109,39 +97,34 @@ function renderRecording(): void {
   overlay.style.right = "0";
   overlay.style.textAlign = "center";
   overlay.style.color = "var(--muted)";
-  overlay.innerHTML = `<div>Hold as still as you can.</div><div id="countdown" class="caption" style="margin-top:0.5rem">${RECORD_SECONDS}s</div>`;
+  overlay.style.pointerEvents = "none";
+  overlay.innerHTML = `
+    <div>${inputMode === "gyro" ? "Tilt to paint" : "Move to paint"}</div>
+    <div id="countdown" class="caption" style="margin-top:0.5rem">${RECORD_SECONDS}s</div>
+  `;
   wrap.appendChild(overlay);
   root.appendChild(wrap);
 
-  seismograph = new Seismograph(canvas, {
-    duration: RECORD_SECONDS,
-    axes: inputMode === "mouse" ? 2 : 3,
-    // After deadband, "still" gyro reads as 0; floor keeps the centerline
-    // visible without amplifying nothing into the whole screen.
-    scaleFloor: inputMode === "mouse" ? 1.5 : 0.15,
-  });
-  seismograph.start();
+  painter = new Painter(canvas, { duration: RECORD_SECONDS });
+  painter.start();
 }
 
-const MORPH_MS = 1600;
-
-function prefersReducedMotion(): boolean {
-  return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-}
-
-function renderFingerprintScreen(features: TremorFeatures, series: { x: number[]; y: number[]; z: number[] }): void {
+function renderFinalScreen(features: TremorFeatures, points: readonly PaintPoint[]): void {
   clearRoot();
   const screen = document.createElement("section");
   screen.className = "screen";
   screen.style.flexDirection = "column";
+
   const canvas = document.createElement("canvas");
   canvas.style.width = "min(90vmin, 540px)";
   canvas.style.height = "min(90vmin, 540px)";
   canvas.style.borderRadius = "12px";
 
+  const { palette, name: paletteName } = pickPalette(points);
+
   const caption = document.createElement("p");
   caption.className = "caption";
-  caption.textContent = "This is your tremor. Everyone has one.";
+  caption.textContent = `your motion painting · ${paletteName}`;
 
   const actions = document.createElement("div");
   actions.className = "actions";
@@ -151,12 +134,6 @@ function renderFingerprintScreen(features: TremorFeatures, series: { x: number[]
     <button id="again">Try again</button>
   `;
 
-  const readout = document.createElement("div");
-  readout.className = "readout";
-  const peak = Math.max(features.x.dominantFreq, features.y.dominantFreq, features.z.dominantFreq);
-  const amp = (features.x.amplitude + features.y.amplitude + features.z.amplitude) / 3;
-  readout.textContent = `${peak.toFixed(2)} Hz · ${(amp * 1000).toFixed(0)} mg · ${features.sampleCount} samples`;
-
   const inner = document.createElement("div");
   inner.style.display = "grid";
   inner.style.placeItems = "center";
@@ -165,14 +142,9 @@ function renderFingerprintScreen(features: TremorFeatures, series: { x: number[]
   inner.appendChild(actions);
 
   screen.appendChild(inner);
-  screen.appendChild(readout);
   root.appendChild(screen);
 
-  renderFingerprint(canvas, {
-    features,
-    series,
-    referenceAmplitude: inputMode === "mouse" ? MOUSE_REF_AMP : GYRO_REF_AMP,
-  });
+  renderPaintingFinal(canvas, points, { palette });
 
   const hash = encodeFeatures(features);
   const shareUrl = `${window.location.origin}${window.location.pathname}?f=${hash}`;
@@ -184,6 +156,43 @@ function renderFingerprintScreen(features: TremorFeatures, series: { x: number[]
   actions.querySelector<HTMLButtonElement>("#share")?.addEventListener("click", () => {
     void shareCanvas(canvas, shareUrl);
   });
+  actions.querySelector<HTMLButtonElement>("#again")?.addEventListener("click", () => {
+    history.replaceState(null, "", window.location.pathname);
+    sm.transition("landing");
+  });
+}
+
+function renderPermalinkFingerprint(features: TremorFeatures): void {
+  clearRoot();
+  const screen = document.createElement("section");
+  screen.className = "screen";
+  screen.style.flexDirection = "column";
+
+  const canvas = document.createElement("canvas");
+  canvas.style.width = "min(90vmin, 540px)";
+  canvas.style.height = "min(90vmin, 540px)";
+  canvas.style.borderRadius = "12px";
+
+  const caption = document.createElement("p");
+  caption.className = "caption";
+  caption.textContent = "shared painting fingerprint";
+
+  const actions = document.createElement("div");
+  actions.className = "actions";
+  actions.innerHTML = `<button id="again">Make your own</button>`;
+
+  const inner = document.createElement("div");
+  inner.style.display = "grid";
+  inner.style.placeItems = "center";
+  inner.appendChild(canvas);
+  inner.appendChild(caption);
+  inner.appendChild(actions);
+
+  screen.appendChild(inner);
+  root.appendChild(screen);
+
+  renderFingerprint(canvas, { features, series: { x: [], y: [], z: [] } });
+
   actions.querySelector<HTMLButtonElement>("#again")?.addEventListener("click", () => {
     history.replaceState(null, "", window.location.pathname);
     sm.transition("landing");
@@ -205,9 +214,22 @@ async function startCalibrating(): Promise<void> {
     }
   }
   setTimeout(() => {
+    if (calibTiltSamples.length > 0) {
+      let sum = 0;
+      for (const v of calibTiltSamples) sum += v;
+      tiltOffset = sum / calibTiltSamples.length;
+    }
+    if (calibPitchSamples.length > 0) {
+      let sum = 0;
+      for (const v of calibPitchSamples) sum += v;
+      pitchOffset = sum / calibPitchSamples.length;
+    }
+    calibTiltSamples.length = 0;
+    calibPitchSamples.length = 0;
     xs.length = 0; ys.length = 0; zs.length = 0;
-    hpX.reset(); hpY.reset(); hpZ.reset();
-    lpX.reset(); lpY.reset(); lpZ.reset();
+    tiltLP = new LowPass(0.25);
+    pitchLP = new LowPass(0.25);
+    speedLP = new LowPass(0.4);
     startRecording();
   }, CALIBRATE_MS);
 }
@@ -215,22 +237,18 @@ async function startCalibrating(): Promise<void> {
 function handleSample(s: Sample): void {
   rawSamplesSeen++;
   if (s.dx !== 0 || s.dy !== 0 || s.dz !== 0) rawAnyNonZero = true;
-  let fx: number, fy: number, fz: number;
-  if (inputMode === "mouse") {
-    // Pixel deltas are already AC and discrete; no filtering needed.
-    fx = s.dx; fy = s.dy; fz = s.dz;
-  } else {
-    // Bandpass: LP kills high-freq sensor noise above ~7 Hz, HP strips
-    // gravity / slow drift, deadband zeroes everything below the noise floor.
-    fx = deadband(hpX.step(lpX.step(s.dx)), GYRO_NOISE_FLOOR);
-    fy = deadband(hpY.step(lpY.step(s.dy)), GYRO_NOISE_FLOOR);
-    fz = deadband(hpZ.step(lpZ.step(s.dz)), GYRO_NOISE_FLOOR);
+
+  if (sm.current === "calibrating") {
+    calibTiltSamples.push(s.tilt);
+    calibPitchSamples.push(s.pitch);
+    return;
   }
   if (sm.current === "recording") {
-    xs.push(fx);
-    ys.push(fy);
-    zs.push(fz);
-    seismograph?.push(fx, fy, fz);
+    const tilt = tiltLP.step(s.tilt - tiltOffset);
+    const pitch = pitchLP.step(s.pitch - pitchOffset);
+    const speed = speedLP.step(s.speed);
+    painter?.push(tilt, pitch, speed);
+    xs.push(s.dx); ys.push(s.dy); zs.push(s.dz);
   }
 }
 
@@ -248,20 +266,24 @@ function startRecording(): void {
     if (elapsed >= RECORD_SECONDS) finishRecording();
   }, 100);
 
-  // Detect a dead motion API: either no samples at all, or samples that are
-  // all literal zero (some Android browsers in private mode). Gravity makes
-  // a working gyro produce non-zero raw samples even on a still phone.
+  // Detect a dead motion API: gravity makes a working gyro produce non-zero
+  // raw samples even on a still phone, so absence of those means broken sensor.
   stallCheck = window.setTimeout(() => {
-    if (inputMode !== "gyro") return;
+    if (adapter?.mode !== "gyro") return;
     if (rawSamplesSeen === 0 || !rawAnyNonZero) {
       showToast("No motion detected — switching to mouse mode.");
       cleanupRecording();
-      adapter?.stop();
+      adapter.stop();
       adapter = new MouseAdapter();
       void adapter.start(handleSample).then(() => {
         xs.length = 0; ys.length = 0; zs.length = 0;
-        hpX.reset(); hpY.reset(); hpZ.reset();
-        lpX.reset(); lpY.reset(); lpZ.reset();
+        tiltLP = new LowPass(0.25);
+        pitchLP = new LowPass(0.25);
+        speedLP = new LowPass(0.4);
+        tiltOffset = 0;
+        pitchOffset = 0;
+        painter?.reset();
+        painter?.start();
         startRecording();
       });
     }
@@ -272,7 +294,7 @@ function startRecording(): void {
 
 function onVisibility(): void {
   if (document.hidden && sm.current === "recording") {
-    showToast("Come back to keep recording.");
+    showToast("Come back to keep painting.");
   }
 }
 
@@ -284,6 +306,48 @@ function cleanupRecording(): void {
   document.removeEventListener("visibilitychange", onVisibility);
 }
 
+function prefersReducedMotion(): boolean {
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+
+function runFlourish(p: Painter, done: () => void): void {
+  const wrap = p.canvas.parentElement;
+  let flash: HTMLDivElement | null = null;
+  if (wrap) {
+    flash = document.createElement("div");
+    flash.style.cssText =
+      "position:absolute;inset:0;background:rgba(255,235,210,0);" +
+      "transition:background 220ms ease-out;pointer-events:none";
+    wrap.appendChild(flash);
+    requestAnimationFrame(() => {
+      if (flash) flash.style.background = "rgba(255,235,210,0.18)";
+    });
+    setTimeout(() => {
+      if (!flash) return;
+      flash.style.transition = "background 580ms ease-out";
+      flash.style.background = "rgba(255,235,210,0)";
+    }, 220);
+  }
+
+  p.hideHead();
+
+  const start = performance.now();
+  const dur = 800;
+  const tick = (): void => {
+    const t = (performance.now() - start) / dur;
+    if (t >= 1) {
+      flash?.remove();
+      done();
+      return;
+    }
+    // Front-load the cascade so the rush hits in the first half.
+    const intensity = t < 0.5 ? 0.6 + t * 0.8 : Math.max(0, 1 - (t - 0.5) * 2);
+    p.cascadeStep(intensity);
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+}
+
 function finishRecording(): void {
   cleanupRecording();
   adapter?.stop();
@@ -291,42 +355,22 @@ function finishRecording(): void {
   const elapsedSec = (performance.now() - recordStart) / 1000;
   const sampleRate = xs.length / Math.max(elapsedSec, 0.001);
   const features = extract(xs, ys, zs, sampleRate);
-  const series = { x: [...xs], y: [...ys], z: [...zs] };
+  const points = painter ? [...painter.capturedPoints] : [];
 
-  const canvas = seismograph?.canvas ?? null;
-  // Stop the live render loop but keep the canvas in the DOM for the morph.
-  seismograph?.destroy();
-  seismograph = null;
-
-  // Hide overlay copy during the morph.
-  const overlay = root.querySelector<HTMLElement>("section .caption")?.parentElement ?? null;
-  if (overlay) overlay.style.opacity = "0";
-
-  const goFingerprint = (): void => {
+  const finalize = (): void => {
+    painter?.destroy();
+    painter = null;
     sm.transition("fingerprint");
-    renderFingerprintScreen(features, series);
+    renderFinalScreen(features, points);
   };
 
-  if (!canvas || prefersReducedMotion()) {
-    sm.transition("revealing");
-    goFingerprint();
+  if (!painter || prefersReducedMotion()) {
+    finalize();
     return;
   }
 
   sm.transition("revealing");
-  runMorph(
-    canvas,
-    {
-      features,
-      series,
-      axes: inputMode === "mouse" ? 2 : 3,
-      duration: MORPH_MS,
-      referenceAmplitude: inputMode === "mouse" ? MOUSE_REF_AMP : GYRO_REF_AMP,
-    },
-    () => {
-      setTimeout(goFingerprint, 500);
-    },
-  );
+  runFlourish(painter, finalize);
 }
 
 function showToast(text: string): void {
@@ -342,8 +386,8 @@ sm.subscribe((state) => {
     case "landing": renderLanding(); break;
     case "calibrating": renderCalibrating(); break;
     case "recording": renderRecording(); break;
-    case "revealing": /* morph runs on the existing recording canvas */ break;
-    case "fingerprint": /* rendered by finishRecording */ break;
+    case "revealing": break;
+    case "fingerprint": break;
   }
 });
 
@@ -352,10 +396,8 @@ function bootstrap(): void {
   if (hash) {
     const features = decodeFeatures(hash);
     if (features) {
-      // Permalink view: render directly, with empty series (no waveform overlay).
       sm.transition("fingerprint");
-      // Permalink view has no series; trace omitted, ring + seal still render.
-      renderFingerprintScreen(features, { x: [], y: [], z: [] });
+      renderPermalinkFingerprint(features);
       return;
     }
   }
